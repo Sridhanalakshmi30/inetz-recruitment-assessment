@@ -1,0 +1,13 @@
+﻿.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.pytest_cache/
+pytest-cache-files-*/
+google-form-temp.html

@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net/pyodide/; worker-src blob:; connect-src https://cdn.jsdelivr.net/pyodide/;">
+<script>
+// Opaque-origin iframe keeps executed code away from portal cookies and APIs.
+let started = false;
+addEventListener('message', event => {
+  if (event.source !== parent || event.data?.type !== 'run' || started) return;
+  started = true;
+  const {source, runId} = event.data;
+  const workerSource = `
+    import {loadPyodide} from 'https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.mjs';
+    self.onmessage = async event => {
+      let output = '';
+      const write = line => { if(output.length < 30000) output += String(line).slice(0,30000-output.length) + '\\n'; };
+      try {
+        const py = await loadPyodide({indexURL:'https://cdn.jsdelivr.net/pyodide/v314.0.7/full/', stdout:write, stderr:write});
+        await py.loadPackagesFromImports(event.data);
+        postMessage({type:'started'});
+        const result = await py.runPythonAsync(event.data);
+        if(result !== undefined) {write(String(result)); result?.destroy?.();}
+      } catch(error) {write(error.message);}
+      postMessage({type:'result',output});
+    };`;
+  const url = URL.createObjectURL(new Blob([workerSource], {type:'text/javascript'}));
+  const worker = new Worker(url, {type:'module'});
+  URL.revokeObjectURL(url);
+  worker.onmessage = e => parent.postMessage({...e.data,runId}, '*');
+  worker.onerror = () => parent.postMessage({type:'result',runId,output:'Unable to start Python. Check the runtime download and browser support.'}, '*');
+  worker.postMessage(source);
+});
+</script>
