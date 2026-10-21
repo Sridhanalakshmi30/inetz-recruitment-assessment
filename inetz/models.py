@@ -22,7 +22,6 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(160))
     role: Mapped[str] = mapped_column(String(24), default="candidate")
-    responsibilities: Mapped[str] = mapped_column(Text, default="[]")
     salt: Mapped[str] = mapped_column(String(64))
     password_hash: Mapped[str] = mapped_column(String(128))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -36,14 +35,8 @@ class Candidate(Base):
     email: Mapped[str] = mapped_column(String(254), index=True)
     mobile: Mapped[str] = mapped_column(String(32), default="")
     role: Mapped[str] = mapped_column(String(100), default="Full Stack")
-    assigned_admin: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     stage: Mapped[str] = mapped_column(String(48), default="Aptitude MCQ")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    final_decision: Mapped[str] = mapped_column(String(40), default="Awaiting decision")
-    tech_recommendation: Mapped[str] = mapped_column(String(40), default="Awaiting interview")
-    communication_status: Mapped[str] = mapped_column(String(40), default="Not communicated")
-    released_result: Mapped[str] = mapped_column(String(40), default="")
-    release_feedback: Mapped[str] = mapped_column(Text, default="")
 
 
 class Attempt(Base):
@@ -55,7 +48,6 @@ class Attempt(Base):
     answers: Mapped[str] = mapped_column(Text, default="{}")
     score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    remarks: Mapped[str] = mapped_column(Text, default="")
     pass_mark: Mapped[int] = mapped_column(Integer, default=8)
     __table_args__ = (UniqueConstraint("candidate_id", "round"),)
 
@@ -86,66 +78,6 @@ class MonitoringEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-
-class MonitoringReview(Base):
-    __tablename__ = "monitoring_reviews"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
-    round: Mapped[str] = mapped_column(String(24))
-    note: Mapped[str] = mapped_column(Text, default="")
-    reviewed_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    __table_args__ = (UniqueConstraint("candidate_id", "round"),)
-
-
-class CodeSubmission(Base):
-    __tablename__ = "code_submissions"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
-    question_id: Mapped[int] = mapped_column(Integer)
-    language: Mapped[str] = mapped_column(String(20))
-    source: Mapped[str] = mapped_column(Text)
-    submitted: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[str] = mapped_column(String(30), default="Not submitted")
-    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    max_score: Mapped[int] = mapped_column(Integer)
-    result: Mapped[str] = mapped_column(Text, default="{}")
-    judge_token: Mapped[str] = mapped_column(String(100), default="")
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-    __table_args__ = (UniqueConstraint("candidate_id", "question_id"),)
-
-
-class Interview(Base):
-    __tablename__ = "interviews"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), unique=True)
-    payload: Mapped[str] = mapped_column(Text)
-    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-
-
-class AppSetting(Base):
-    __tablename__ = "app_settings"
-    key: Mapped[str] = mapped_column(String(80), primary_key=True)
-    value: Mapped[str] = mapped_column(Text)
-
-
-class Invitation(Base):
-    __tablename__ = "candidate_invitations"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    redeemed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-class Audit(Base):
-    __tablename__ = "audit_log"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    candidate_id: Mapped[int | None] = mapped_column(ForeignKey("candidates.id"), nullable=True)
-    action: Mapped[str] = mapped_column(String(100))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 APTITUDE = [
@@ -228,26 +160,7 @@ def mcq_snapshot(round_name, role=""):
     return [{"id": i + 1, "question": q, "options": opts, "answer": answer} for i, (q, opts, answer) in enumerate(generic)]
 
 
-CODING = [
-    {"id": 1, "title": "Two Sum", "difficulty": "Intermediate", "marks": 20, "statement": "Find the positions of two numbers in the list that add up to the target. Return the two positions as a list. Positions start at 0. There is exactly one correct pair, and you cannot use the same list item twice.", "constraints": "The list has 2 to 100,000 numbers. Each number and the target are between -1,000,000,000 and 1,000,000,000. Aim for a solution that checks the list once.", "examples": [{"input": "nums = [2, 7, 11, 15], target = 9", "output": "[0, 1]", "explanation": "nums[0] is 2 and nums[1] is 7. 2 + 7 = 9, so return their positions: [0, 1]."}], "tests": [[[2, 7, 11, 15], 9, [0, 1]], [[3, 2, 4], 6, [1, 2]], [[3, 3], 6, [0, 1]]]},
-    {"id": 2, "title": "Longest Unique Substring", "difficulty": "Advanced", "marks": 40, "statement": "Find the length of the longest piece of the text that has no repeated characters. The piece must be continuous: characters next to each other in the original text.", "constraints": "The text can be empty or contain up to 50,000 letters, numbers, spaces, or symbols.", "examples": [{"input": 's = "abcabcbb"', "output": "3", "explanation": "The piece \"abc\" has no repeated characters and has length 3. Longer pieces repeat a character."}], "tests": [["abcabcbb", 3], ["bbbbb", 1], ["pwwkew", 3], ["", 0]]},
-    {"id": 3, "title": "Merge Overlapping Intervals", "difficulty": "Advanced", "marks": 40, "statement": "You are given ranges written as [start, end]. Combine ranges that overlap, then return the combined ranges in order from smallest start to largest start.", "constraints": "There are 1 to 100,000 ranges. Each range has a start and end between 0 and 10,000. A range's start is never greater than its end.", "examples": [{"input": "[[1, 3], [2, 6], [8, 10]]", "output": "[[1, 6], [8, 10]]", "explanation": "[1, 3] and [2, 6] overlap, so combine them into [1, 6]. [8, 10] does not overlap, so keep it separate."}], "tests": [[[[1, 3], [2, 6], [8, 10], [15, 18]], [[1, 6], [8, 10], [15, 18]]], [[[1, 4], [4, 5]], [[1, 5]]], [[[1, 4]], [[1, 4]]]]},
-]
-
-
-def starter(qid, language):
-    if language == "python":
-        fn = ["def solution(nums, target):\n    pass", "def solution(s):\n    pass", "def solution(intervals):\n    pass"][qid - 1]
-        return fn + "\n\nif __name__ == '__main__':\n    import json, sys\n    data=json.load(sys.stdin)\n    print(json.dumps(solution(*data) if isinstance(data,list) else solution(data)))"
-    if language == "javascript":
-        fn = ["function solution(nums, target) {\n  // your code\n}", "function solution(s) {\n  // your code\n}", "function solution(intervals) {\n  // your code\n}"][qid - 1]
-        return fn + "\nconst data=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(JSON.stringify(Array.isArray(data)&&Array.isArray(data[0]) ? solution(...data) : solution(data)));"
-    fn = ["static int[] solution(int[] nums, int target) { return new int[0]; }", "static int solution(String s) { return 0; }", "static int[][] solution(int[][] intervals) { return intervals; }"][qid - 1]
-    return "import java.util.*;\npublic class Main {\n  " + fn + "\n  public static void main(String[] args) { /* read JSON input and print JSON result */ }\n}"
-
-
 class Login(BaseModel): email: EmailStr; password: str
-class Register(BaseModel): name: str = Field(min_length=2, max_length=160); email: EmailStr; password: str = Field(min_length=10); mobile: str = ""; role: str = "Full Stack"
 class CandidateSignup(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     email: EmailStr
@@ -263,22 +176,9 @@ class CandidateSignup(BaseModel):
         if not re.fullmatch(r"\+?[0-9\s().-]+", value) or not 7 <= len(digits) <= 15:
             raise ValueError("Enter a valid phone number with 7 to 15 digits")
         return value
-class AdminSignup(BaseModel): name: str = Field(min_length=2, max_length=160); email: EmailStr; password: str = Field(min_length=10)
-class Redeem(BaseModel): token: str = Field(min_length=20, max_length=200); password: str = Field(min_length=8, max_length=8)
-class CandidateIn(BaseModel): name: str = Field(min_length=2, max_length=160); email: EmailStr; mobile: str = ""; role: str = "Full Stack"; admin_id: int | None = None
-class AssignIn(BaseModel): admin_id: int | None = None
 class SaveAnswers(BaseModel): answers: dict[str, int]
 class StartAssessment(BaseModel): acknowledged: bool
-class MonitorIn(BaseModel): kind: str; event_key: str = Field(min_length=8, max_length=64); answers: dict[str, int] | None = None; question_id: int | None = None; language: str | None = None; source: str | None = None
-class CodeIn(BaseModel): question_id: int; language: str; source: str
-class CodeReviewIn(BaseModel): score: int = Field(ge=0); feedback: str = Field(min_length=1, max_length=5000)
-class InterviewIn(BaseModel): interview_date: str = ""; interviewer: str = ""; questions: str = ""; responses: str = ""; strengths: str = ""; gaps: str = ""; communication: str = ""; remarks: str = ""; next_steps: str = ""; recommendation: str
-class DecisionIn(BaseModel): decision: str; remarks: str = ""; next_steps: str = ""; released_result: str = ""; release_feedback: str = ""; channel: str = ""; communicator: str = ""
-class RemarksIn(BaseModel): remarks: str
-class MonitoringReviewIn(BaseModel): note: str = Field(max_length=5000)
-class CommunicateIn(BaseModel): channel: str; communicator: str = ""; status: str = "Sent"
-class StaffIn(BaseModel): name: str; email: EmailStr; password: str = ""; responsibilities: list[str] = []
-class ConfigIn(BaseModel): pass_marks: dict[str, int] = {"aptitude": 8, "technical": 8, "coding": 60}; violation_limit: int = Field(default=3, ge=0, le=20); assessment_minutes: int = Field(default=60, ge=5, le=240)
+class MonitorIn(BaseModel): kind: str; event_key: str = Field(min_length=8, max_length=64); answers: dict[str, int] | None = None
 
 
 
