@@ -34,6 +34,10 @@ class Candidate(Base):
     full_name: Mapped[str] = mapped_column(String(160))
     email: Mapped[str] = mapped_column(String(254), index=True)
     mobile: Mapped[str] = mapped_column(String(32), default="")
+    degree: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    stream: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    candidate_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    area_of_interest: Mapped[str | None] = mapped_column(String(160), nullable=True)
     role: Mapped[str] = mapped_column(String(100), default="Full Stack")
     stage: Mapped[str] = mapped_column(String(48), default="Aptitude MCQ")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -66,6 +70,21 @@ class AssessmentSession(Base):
     open_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     submission_reason: Mapped[str] = mapped_column(String(120), default="")
     __table_args__ = (UniqueConstraint("candidate_id", "round"),)
+
+
+class AssessmentHistory(Base):
+    __tablename__ = "assessment_history"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
+    round: Mapped[str] = mapped_column(String(24))
+    score: Mapped[int] = mapped_column(Integer)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    details: Mapped[str] = mapped_column(Text)
+
+
+class QuestionPoolLock(Base):
+    __tablename__ = "question_pool_lock"
+    id: Mapped[int] = mapped_column(primary_key=True)
 
 
 class MonitoringEvent(Base):
@@ -138,18 +157,32 @@ def technical_domain(role):
     return None
 
 
-def mcq_snapshot(round_name, role=""):
+def pick_questions(pool, count, candidate_seen, global_seen):
+    unique = {item["question"]: item for item in pool}.values()
+    available = [item for item in unique if item["question"] not in candidate_seen and item["question"] not in global_seen]
+    if len(available) < count:
+        raise ValueError("Not enough unused questions remain in the shared question bank")
+    return secrets.SystemRandom().sample(available, count)
+
+
+def display_question(question):
+    return re.sub(r"^Scenario\s+\d+\s*:\s*", "", question, count=1, flags=re.IGNORECASE)
+
+
+def mcq_snapshot(round_name, role="", candidate_seen=None, global_seen=None):
+    candidate_seen = candidate_seen or set()
+    global_seen = global_seen or set()
     if round_name == "aptitude":
         rng = secrets.SystemRandom()
-        chosen = [("Logical", q) for q in rng.sample(APTITUDE_BANK["logical"], 8)]
-        chosen += [("Quantitative", q) for q in rng.sample(APTITUDE_BANK["quantitative"], 7)]
+        chosen = [("Logical", q) for q in pick_questions(APTITUDE_BANK["logical"], 8, candidate_seen, global_seen)]
+        chosen += [("Quantitative", q) for q in pick_questions(APTITUDE_BANK["quantitative"], 7, candidate_seen, global_seen)]
         rng.shuffle(chosen)
-        return [{"id": i + 1, "category": category, "source_id": q["id"], "question": q["question"], "options": q["options"], "answer": q["answer"]} for i, (category, q) in enumerate(chosen)]
+        return [{"id": i + 1, "category": category, "source_id": q["id"], "question": display_question(q["question"]), "options": q["options"], "answer": q["answer"]} for i, (category, q) in enumerate(chosen)]
     domain = technical_domain(role)
     pool = TECHNICAL_BANKS.get(domain) if domain else None
     if pool:
-        chosen = secrets.SystemRandom().sample(pool, 20)
-        return [{"id": i + 1, "source_id": q["id"], "domain": domain, "category": q["category"], "question": q["question"], "options": q["options"], "answer": q["answer"]} for i, q in enumerate(chosen)]
+        chosen = pick_questions(pool, 20, candidate_seen, global_seen)
+        return [{"id": i + 1, "source_id": q["id"], "domain": domain, "category": q["category"], "question": display_question(q["question"]), "options": q["options"], "answer": q["answer"]} for i, q in enumerate(chosen)]
     generic = TECH + [
         ("Which HTTP method is normally used to retrieve data?", ["POST", "GET", "PATCH", "DELETE"], 1),
         ("What does a primary key identify?", ["A unique row", "A database server", "A CSS class", "A network route"], 0),
@@ -157,15 +190,26 @@ def mcq_snapshot(round_name, role=""):
         ("Which SQL command adds a new row?", ["INSERT", "ALTER", "DROP", "GRANT"], 0),
         ("What does JSON represent?", ["A data interchange format", "A database engine", "A programming language", "A web server"], 0),
     ]
-    return [{"id": i + 1, "question": q, "options": opts, "answer": answer} for i, (q, opts, answer) in enumerate(generic)]
+    chosen = pick_questions([{"question": q, "options": opts, "answer": answer} for q, opts, answer in generic], 20, candidate_seen, global_seen)
+    return [{"id": i + 1, **item} for i, item in enumerate(chosen)]
 
 
 class Login(BaseModel): email: EmailStr; password: str
 class CandidateSignup(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     email: EmailStr
-    password: str = Field(min_length=8, max_length=8)
+    password: str = Field(min_length=8, max_length=128)
     mobile: str = Field(min_length=7, max_length=24)
+    degree: str = Field(min_length=2, max_length=100)
+    stream: str = Field(min_length=2, max_length=100)
+    candidate_status: str = Field(pattern="^(Fresher|Experienced|Career gap|Student)$")
+
+    @field_validator("name", "degree", "stream", "role")
+    @classmethod
+    def nonblank_detail(cls, value):
+        if len(value.strip()) < 2:
+            raise ValueError("Enter at least 2 characters")
+        return value.strip()
     role: str = Field(default="Full Stack", min_length=2, max_length=100)
 
     @field_validator("mobile")

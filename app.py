@@ -9,16 +9,29 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 load_dotenv()
 from inetz.database import DB, DATABASE_URL, engine
 from inetz.models import *
+from inetz.sheet_sync import sync_candidate_safely
 
 app = FastAPI(title="iNetz Recruitment", version="1.0")
 app.mount("/assets", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="assets")
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+
+
+def cookie_secure():
+    return os.getenv("COOKIE_SECURE", "false").lower() == "true"
+
+
+def set_session_cookie(response, user):
+    token_id = str(user.id)
+    secret = os.getenv("SESSION_SECRET", "local-development-secret-change-before-deploy-32-chars")
+    sig = hmac.new(secret.encode(), token_id.encode(), hashlib.sha256).hexdigest()
+    response.set_cookie("inetz_session", token_id + "." + sig, httponly=True,
+                        secure=cookie_secure(), samesite="lax", max_age=43200)
 
 def db_session():
     with DB() as session: yield session
@@ -44,29 +57,49 @@ def require(user, roles):
 
 def view_attempt(a, internal=False):
     snapshot = json.loads(a.snapshot)
-    data = {"round": a.round, "answers": json.loads(a.answers), "score": a.score, "max_score": len(snapshot), "submitted_at": a.submitted_at.isoformat() if a.submitted_at else None, "pass_mark": a.pass_mark, "questions": [{k: v for k, v in item.items() if k != "answer"} for item in snapshot]}
+    answers = json.loads(a.answers)
+    result = evaluate_mcq(snapshot, answers) if a.submitted_at else {}
+    data = {"round": a.round, "answers": answers, "score": a.score, "max_score": len(snapshot),
+            "submitted_at": utc(a.submitted_at).isoformat() if a.submitted_at else None,
+            "pass_mark": a.pass_mark, "result": result,
+            "questions": [{k: v for k, v in item.items() if k != "answer"} for item in snapshot]}
     return data
 
 
 def public_candidate(c, internal=False):
-    d = {"id": c.id, "name": c.full_name, "email": c.email, "mobile": c.mobile, "role": c.role, "stage": c.stage, "created_at": c.created_at.isoformat()}
+    d = {"id": c.id, "name": c.full_name, "email": c.email, "mobile": c.mobile, "degree": c.degree, "stream": c.stream, "candidate_status": c.candidate_status, "area_of_interest": c.area_of_interest, "role": c.role, "stage": c.stage, "created_at": utc(c.created_at).isoformat()}
     return d
+
+
+def fresh_snapshot(db, candidate, round_name):
+    # A write lock also serializes allocations on SQLite, where FOR UPDATE is ignored.
+    db.execute(update(QuestionPoolLock).where(QuestionPoolLock.id == 1).values(id=1))
+    seen = set()
+    global_seen = set()
+    sources = [(candidate_id, json.loads(snapshot)) for candidate_id, snapshot in db.execute(
+        select(Attempt.candidate_id, Attempt.snapshot).where(Attempt.round == round_name).with_for_update())]
+    sources += [(candidate_id, json.loads(json.loads(details)["snapshot"])) for candidate_id, details in db.execute(
+        select(AssessmentHistory.candidate_id, AssessmentHistory.details).where(AssessmentHistory.round == round_name).with_for_update())]
+    for candidate_id, questions in sources:
+        texts = {item["question"] for item in questions}
+        global_seen.update(texts)
+        if candidate_id == candidate.id: seen.update(texts)
+    try:
+        return mcq_snapshot(round_name, candidate.role, seen, global_seen)
+    except ValueError as error:
+        raise HTTPException(409, f"{error}. More questions must be added before another attempt.") from error
 
 
 def ensure_attempt(db, c, r):
     a = db.scalar(select(Attempt).where(Attempt.candidate_id == c.id, Attempt.round == r))
     if not a:
+        db.execute(update(QuestionPoolLock).where(QuestionPoolLock.id == 1).values(id=1))
+        a = db.scalar(select(Attempt).where(Attempt.candidate_id == c.id, Attempt.round == r))
+    if not a:
         expected_stage = "Aptitude MCQ" if r == "aptitude" else "Technical MCQ"
         if c.stage != expected_stage: raise HTTPException(409, "This assessment round is not currently available")
-        a = Attempt(candidate_id=c.id, round=r, snapshot=json.dumps(mcq_snapshot(r, c.role)), pass_mark=int(app.state.config["pass_marks"][r]))
+        a = Attempt(candidate_id=c.id, round=r, snapshot=json.dumps(fresh_snapshot(db, c, r)), pass_mark=int(app.state.config["pass_marks"][r]))
         db.add(a); db.commit(); db.refresh(a)
-    elif r == "technical" and not a.submitted_at and not json.loads(a.answers or "{}"):
-        domain = technical_domain(c.role)
-        snapshot = json.loads(a.snapshot)
-        session = assessment_session(db, c.id, r)
-        if domain and not any(item.get("domain") == domain for item in snapshot) and (not session or not session.started_at):
-            a.snapshot = json.dumps(mcq_snapshot(r, c.role))
-            db.commit()
     return a
 
 
@@ -97,21 +130,33 @@ def start_assessment_session(db, c, round_name):
 
 
 def validate_answers(answers, max_questions):
-    if any(not k.isdigit() or int(k) < 1 or int(k) > max_questions or v not in range(4) for k, v in answers.items()):
+    if not isinstance(answers, dict) or any(
+        not isinstance(k, str) or not k.isdigit() or not 1 <= int(k) <= max_questions
+        or type(v) is not int or not 0 <= v < 4
+        for k, v in answers.items()
+    ):
         raise HTTPException(422, "Invalid answer selection")
+
+
+def evaluate_mcq(snapshot, answers):
+    """Score a saved question snapshot; unanswered questions earn zero."""
+    correct = sum(answers.get(str(index)) == item["answer"] for index, item in enumerate(snapshot, 1))
+    answered = len(answers)
+    return {"score": correct, "max_score": len(snapshot), "correct_count": correct,
+            "wrong_count": answered - correct, "unanswered_count": len(snapshot) - answered}
 
 
 def finish_mcq(db, c, attempt, session, reason):
     if attempt.submitted_at: return
     answers = json.loads(attempt.answers)
     snapshot = json.loads(attempt.snapshot)
-    bank = APTITUDE if attempt.round == "aptitude" else TECH
-    attempt.score = sum(1 for i, item in enumerate(snapshot, 1) if answers.get(str(i)) == (item["answer"] if "answer" in item else bank[i - 1][2]))
+    attempt.score = evaluate_mcq(snapshot, answers)["score"]
     attempt.submitted_at = now()
     c.stage = "Technical MCQ" if attempt.round == "aptitude" else "Completed"
     session.finished_at = attempt.submitted_at
     session.submission_reason = reason
     db.commit()
+    sync_candidate_safely(db, c.id)
 
 
 
@@ -119,6 +164,16 @@ def finish_mcq(db, c, attempt, session, reason):
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
+    with DB() as db:
+        if not db.get(QuestionPoolLock, 1):
+            db.add(QuestionPoolLock(id=1))
+            try: db.commit()
+            except IntegrityError: db.rollback()
+    existing = {column["name"] for column in inspect(engine).get_columns("candidates")}
+    with engine.begin() as connection:
+        for name, length in (("degree", 100), ("stream", 100), ("candidate_status", 24), ("area_of_interest", 160)):
+            if name not in existing:
+                connection.execute(text(f"ALTER TABLE candidates ADD COLUMN {name} VARCHAR({length}) NULL"))
     app.state.config = {"pass_marks": {"aptitude": 8, "technical": 8}, "violation_limit": 3}
 
 @app.get("/api/health")
@@ -134,28 +189,36 @@ def login(body: Login, response: Response, db: Session = Depends(db_session)):
     user = db.scalar(select(User).where(User.email == body.email.lower()))
     if not user or user.role != "candidate" or not user.active or not hmac.compare_digest(user.password_hash, digest(body.password, user.salt)):
         raise HTTPException(401, "Email or password is incorrect")
-    token_id = str(user.id); sig = hmac.new(os.getenv("SESSION_SECRET", "local-development-secret-change-before-deploy-32-chars").encode(), token_id.encode(), hashlib.sha256).hexdigest()
-    response.set_cookie("inetz_session", token_id + "." + sig, httponly=True, secure=COOKIE_SECURE, samesite="lax", max_age=43200)
+    set_session_cookie(response, user)
     return {"id": user.id, "name": user.name, "role": user.role}
 
 
 @app.post("/api/logout")
-def logout(response: Response): response.delete_cookie("inetz_session", httponly=True, secure=COOKIE_SECURE, samesite="lax"); return {"ok": True}
+def logout(response: Response): response.delete_cookie("inetz_session", httponly=True, secure=cookie_secure(), samesite="lax"); return {"ok": True}
 
 
 @app.post("/api/candidate/register")
-def candidate_signup(body: CandidateSignup, db: Session = Depends(db_session)):
-    email = body.email.lower()
+def candidate_signup(body: CandidateSignup, response: Response, db: Session = Depends(db_session)):
+    email = str(body.email).lower()
     if db.scalar(select(User).where(User.email == email)) or db.scalar(select(Candidate).where(Candidate.email == email)):
-        raise HTTPException(409, "An account with this email already exists")
+        return {"ok": False, "account_exists": True}
     salt = secrets.token_hex(16)
-    candidate_user = User(email=email, name=body.name, role="candidate", salt=salt,
-                          password_hash=digest(body.password, salt))
-    db.add(candidate_user); db.flush()
-    candidate = Candidate(user_id=candidate_user.id, full_name=body.name, email=email, mobile=body.mobile,
-                          role=body.role.strip())
-    db.add(candidate); db.commit()
-    return {"ok": True, "message": "Your candidate account is ready. Sign in to continue."}
+    candidate_user = User(email=email, name=body.name, role="candidate",
+                          salt=salt, password_hash=digest(body.password, salt))
+    try:
+        db.add(candidate_user)
+        db.flush()
+        candidate = Candidate(user_id=candidate_user.id, full_name=body.name, email=email,
+                              mobile=body.mobile, degree=body.degree.strip(), stream=body.stream.strip(),
+                              candidate_status=body.candidate_status, role=body.role.strip())
+        db.add(candidate)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": False, "account_exists": True}
+    sync_candidate_safely(db, candidate.id)
+    set_session_cookie(response, candidate_user)
+    return {"ok": True, "message": "Registration complete."}
 
 
 @app.get("/api/me")
@@ -180,13 +243,60 @@ def session_status(request: Request, db: Session = Depends(db_session)):
 def candidate_home(user=Depends(current_user), db: Session = Depends(db_session)):
     require(user, ["candidate"]); c = db.scalar(select(Candidate).where(Candidate.user_id == user.id))
     if not c: raise HTTPException(404, "Candidate profile not found")
-    attempts = db.scalars(select(Attempt).where(Attempt.candidate_id == c.id)).all()
+    if c.stage == "Coding":
+        c.stage = "Completed"
+        db.commit()
+    attempts = db.execute(select(Attempt.round, Attempt.answers, Attempt.score, Attempt.submitted_at)
+                          .where(Attempt.candidate_id == c.id)).all()
+    history = db.execute(select(AssessmentHistory.round, AssessmentHistory.score, AssessmentHistory.submitted_at)
+                         .where(AssessmentHistory.candidate_id == c.id)
+                         .order_by(AssessmentHistory.submitted_at.desc())).all()
     mcq_sessions = db.scalars(select(AssessmentSession).where(AssessmentSession.candidate_id == c.id,
                              AssessmentSession.round.in_(["aptitude", "technical"]))).all()
     stages = {"Aptitude MCQ": "aptitude", "Technical MCQ": "technical", "Completed": "result"}
     stage_key = stages.get(c.stage, "result")
-    attempt_views = [view_attempt(a) for a in attempts]
-    return {"candidate": public_candidate(c), "active_stage": stage_key, "attempts": attempt_views, "assessment_sessions": {item.round: session_view(item) for item in mcq_sessions}}
+    attempt_views = [{"round": a.round, "answers": json.loads(a.answers or "{}"), "score": a.score,
+                      "submitted_at": utc(a.submitted_at).isoformat() if a.submitted_at else None} for a in attempts]
+    completed = {item.round: item for item in attempts if item.submitted_at}
+    retake_at = utc(completed["technical"].submitted_at) + timedelta(days=1) if c.stage == "Completed" and len(completed) == 2 else None
+    return {"candidate": public_candidate(c), "active_stage": stage_key, "attempts": attempt_views, "assessment_sessions": {item.round: session_view(item) for item in mcq_sessions},
+            "retake_available_at": retake_at.isoformat() if retake_at else None,
+            "history": [{"round": item.round, "score": item.score, "submitted_at": utc(item.submitted_at).isoformat()} for item in history]}
+
+
+@app.post("/api/candidate/retake")
+def retake_assessments(user=Depends(current_user), db: Session = Depends(db_session)):
+    db.execute(update(QuestionPoolLock).where(QuestionPoolLock.id == 1).values(id=1))
+    c = db.scalar(select(Candidate).where(Candidate.user_id == user.id).with_for_update())
+    if c.stage == "Coding": c.stage = "Completed"
+    attempts = db.scalars(select(Attempt).where(Attempt.candidate_id == c.id)).all()
+    completed = {item.round: item for item in attempts if item.submitted_at}
+    if c.stage != "Completed" or len(completed) != 2:
+        raise HTTPException(409, "Complete both assessments before starting a new daily attempt")
+    ready_at = utc(completed["technical"].submitted_at) + timedelta(days=1)
+    if now() < ready_at:
+        raise HTTPException(409, f"Your next attempt is available after {ready_at.isoformat()}")
+    fresh_snapshot(db, c, "aptitude")
+    fresh_snapshot(db, c, "technical")
+    sessions = db.scalars(select(AssessmentSession).where(AssessmentSession.candidate_id == c.id)).all()
+    for attempt in attempts:
+        session = next((item for item in sessions if item.round == attempt.round), None)
+        events = db.scalars(select(MonitoringEvent).where(MonitoringEvent.session_id == session.id).order_by(MonitoringEvent.id)).all() if session else []
+        details = {"snapshot": attempt.snapshot, "answers": attempt.answers, "pass_mark": attempt.pass_mark,
+                   "session": {"started_at": utc(session.started_at).isoformat(), "deadline_at": utc(session.deadline_at).isoformat(),
+                               "finished_at": utc(session.finished_at).isoformat() if session.finished_at else None,
+                               "warning_count": session.warning_count, "submission_reason": session.submission_reason} if session else None,
+                   "events": [{"event_key": event.event_key, "kind": event.kind, "incident_id": event.incident_id,
+                               "occurred_at": utc(event.occurred_at).isoformat(), "duration_ms": event.duration_ms} for event in events]}
+        db.add(AssessmentHistory(candidate_id=c.id, round=attempt.round, score=attempt.score,
+                                 submitted_at=attempt.submitted_at, details=json.dumps(details)))
+        for event in events: db.delete(event)
+        db.delete(attempt)
+    for session in sessions: db.delete(session)
+    c.stage = "Aptitude MCQ"
+    db.commit()
+    sync_candidate_safely(db, c.id)
+    return {"ready": True}
 
 
 @app.get("/api/candidate/assessment/{round_name}")
@@ -295,14 +405,19 @@ def submit_assessment(round_name: str, user=Depends(current_user), db: Session =
     c = db.scalar(select(Candidate).where(Candidate.user_id == user.id)); a = ensure_attempt(db, c, round_name)
     session = assessment_session(db, c.id, round_name, lock=True)
     if session: db.refresh(a)
-    if a.submitted_at: return {"score": a.score, "submitted_at": a.submitted_at.isoformat(), "submission_reason": session.submission_reason if session else ""}
+    if a.submitted_at:
+        result = evaluate_mcq(json.loads(a.snapshot), json.loads(a.answers))
+        return result | {"pass_mark": a.pass_mark,
+                "submitted_at": utc(a.submitted_at).isoformat(), "next_stage": c.stage,
+                "submission_reason": session.submission_reason if session else ""}
     if not session: raise HTTPException(409, "Acknowledge the rules and start the assessment first")
     if session.open_incident: raise HTTPException(409, "Assessment paused. Return to fullscreen to continue.")
     if (round_name == "aptitude" and c.stage != "Aptitude MCQ") or (round_name == "technical" and c.stage != "Technical MCQ"):
         raise HTTPException(409, "This assessment round is not currently available")
     reason = "Assessment time expired." if utc(session.deadline_at) <= now() else "Candidate submitted assessment."
     finish_mcq(db, c, a, session, reason)
-    return {"score": a.score, "max_score": len(json.loads(a.snapshot)), "pass_mark": a.pass_mark, "submitted_at": a.submitted_at.isoformat(), "next_stage": c.stage, "submission_reason": session.submission_reason}
+    result = evaluate_mcq(json.loads(a.snapshot), json.loads(a.answers))
+    return result | {"pass_mark": a.pass_mark, "submitted_at": utc(a.submitted_at).isoformat(), "next_stage": c.stage, "submission_reason": session.submission_reason}
 
 
 

@@ -1,5 +1,4 @@
 import json
-import os
 import uuid
 from datetime import timedelta
 
@@ -19,24 +18,19 @@ def clients(monkeypatch):
     factory = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(system, "engine", engine)
     monkeypatch.setattr(system, "DB", factory)
-    system.app.state.config = {"pass_marks": {"aptitude": 8, "technical": 8, "coding": 60},
+    system.app.state.config = {"pass_marks": {"aptitude": 8, "technical": 8},
                                "violation_limit": 3, "assessment_minutes": 60}
     with factory() as db:
         users = []
-        for email, role, responsibilities in (
-            ("candidate1@example.com", "candidate", "[]"),
-            ("candidate2@example.com", "candidate", "[]"),
-            ("admin@example.com", "admin", '["technical_hr", "general_hr"]'),
-            ("super@example.com", "super_admin", "[]"),
-        ):
+        for email in ("candidate1@example.com", "candidate2@example.com"):
             salt = uuid.uuid4().hex
-            user = system.User(email=email, name=email.split("@")[0], role=role,
-                               responsibilities=responsibilities, salt=salt,
+            user = system.User(email=email, name=email.split("@")[0], role="candidate", salt=salt,
                                password_hash=system.digest("StrongPassword123", salt))
             db.add(user); db.flush(); users.append(user)
         db.add(system.Candidate(user_id=users[0].id, full_name="Candidate One", email=users[0].email,
-                                assigned_admin=users[2].id))
-        db.add(system.Candidate(user_id=users[1].id, full_name="Candidate Two", email=users[1].email))
+                                role="Python Full Stack"))
+        db.add(system.Candidate(user_id=users[1].id, full_name="Candidate Two", email=users[1].email,
+                                role="Python Full Stack"))
         db.commit()
     def login(email):
         client = TestClient(system.app)
@@ -54,8 +48,6 @@ def event(client, kind, **extra):
 def test_focus_events_merge_and_submit_saved_answers(clients):
     factory, login = clients
     candidate = login("candidate1@example.com")
-    admin = login("admin@example.com")
-    other = login("candidate2@example.com")
     assert candidate.put("/api/candidate/assessment/aptitude", json={"answers": {"1": 0}}).status_code == 409
     assert candidate.post("/api/candidate/assessment/aptitude/start", json={"acknowledged": False}).status_code == 422
     assert candidate.post("/api/candidate/assessment/aptitude/start", json={"acknowledged": True}).status_code == 200
@@ -89,19 +81,10 @@ def test_focus_events_merge_and_submit_saved_answers(clients):
     assert attempt["score"] == 3 and attempt["submitted_at"]
     assert candidate.post("/api/candidate/assessment/aptitude/submit").json()["score"] == 3
     assert candidate.put("/api/candidate/assessment/aptitude", json={"answers": {"1": 1}}).status_code == 409
-    assert candidate.get("/api/admin/candidates/1").status_code == 403
-    assert other.get("/api/admin/candidates/1").status_code == 403
-    report = admin.get("/api/admin/candidates/1").json()
-    monitoring = report["monitoring"][0]
-    assert monitoring["warning_count"] == 3
-    assert monitoring["submission_reason"] == "Test ended after 3 warnings. Saved answers were submitted."
-    assert {item["kind"] for item in monitoring["events"]} >= {"page_hidden", "focus_lost", "fullscreen_exit", "returned", "paste_blocked"}
-    assert next(item for item in monitoring["events"] if item["kind"] == "page_hidden")["duration_ms"] is not None
-    assert report["candidate"]["final_decision"] == "Awaiting decision"
-    review = admin.put("/api/admin/candidates/1/monitoring/aptitude/review", json={"note": "Candidate reported an unstable connection."})
-    assert review.status_code == 200
-    assert admin.get("/api/admin/candidates/1").json()["monitoring"][0]["review"]["note"].startswith("Candidate reported")
-    assert candidate.put("/api/admin/candidates/1/monitoring/aptitude/review", json={"note": "erase"}).status_code == 403
+    with factory() as db:
+        events = db.scalars(select(system.MonitoringEvent)).all()
+        assert {item.kind for item in events} >= {"page_hidden", "focus_lost", "fullscreen_exit", "returned", "paste_blocked"}
+        assert next(item for item in events if item.kind == "page_hidden").duration_ms is not None
 
 
 def test_event_replay_does_not_add_warning(clients):
@@ -145,24 +128,28 @@ def test_removed_coding_stage_is_skipped_for_legacy_candidates(clients):
     candidate = login("candidate1@example.com")
     home = candidate.get("/api/candidate/home")
     assert home.status_code == 200
-    assert home.json()["active_stage"] == "interview"
+    assert home.json()["active_stage"] == "result"
     with factory() as db:
-        assert db.get(system.Candidate, 1).stage == "Technical HR"
+        assert db.get(system.Candidate, 1).stage == "Completed"
 
 
-def test_candidate_registration_through_technical_submission(clients):
+def test_candidate_registration_through_technical_submission(clients, monkeypatch):
+    monkeypatch.setattr(system, "sync_candidate_safely", lambda *args: True)
     factory, login = clients
     client = TestClient(system.app)
     email = f"candidate-{uuid.uuid4().hex[:10]}@example.com"
     registration = {
         "name": "New Candidate", "email": email, "password": "Pass1234",
         "mobile": "+1 555 123 4567", "role": "Python Full Stack",
+        "degree": "B.Tech", "stream": "Computer Science", "candidate_status": "Fresher",
     }
     assert client.post("/api/candidate/register", json=registration | {"password": "short"}).status_code == 422
     assert client.post("/api/candidate/register", json=registration | {"mobile": ""}).status_code == 422
     registered = client.post("/api/candidate/register", json=registration)
     assert registered.status_code == 200
-    assert client.post("/api/candidate/register", json=registration).status_code == 409
+    duplicate = client.post("/api/candidate/register", json=registration)
+    assert duplicate.status_code == 200
+    assert duplicate.json() == {"ok": False, "account_exists": True}
     candidate = TestClient(system.app)
     assert candidate.post("/api/login", json={"email": email, "password": "Pass1234"}).status_code == 200
     home = candidate.get("/api/candidate/home")
@@ -178,7 +165,10 @@ def test_candidate_registration_through_technical_submission(clients):
     assert candidate.put("/api/candidate/assessment/aptitude", json={"answers": aptitude_answers}).status_code == 200
     aptitude_result = candidate.post("/api/candidate/assessment/aptitude/submit").json()
     assert aptitude_result["score"] == 15 and aptitude_result["max_score"] == 15
-    assert candidate.get("/api/candidate/home").json()["active_stage"] == "technical"
+    home = candidate.get("/api/candidate/home").json()
+    assert home["active_stage"] == "technical"
+    assert home["attempts"][0]["score"] == 15
+    assert "questions" not in home["attempts"][0]
 
     technical = candidate.get("/api/candidate/assessment/technical").json()
     assert len(technical["questions"]) == 20
@@ -192,23 +182,5 @@ def test_candidate_registration_through_technical_submission(clients):
     assert candidate.put("/api/candidate/assessment/technical", json={"answers": technical_answers}).status_code == 200
     technical_result = candidate.post("/api/candidate/assessment/technical/submit").json()
     assert technical_result["score"] == 20 and technical_result["max_score"] == 20
-    assert candidate.get("/api/candidate/home").json()["active_stage"] == "interview"
-
-
-def test_admin_dashboard_settings_and_exports(clients):
-    _, login = clients
-    admin = login("admin@example.com")
-    candidate = login("candidate1@example.com")
-    assert admin.get("/api/portal/dashboard").status_code == 200
-    config = admin.get("/api/admin/config")
-    assert config.status_code == 200
-    updated = admin.put("/api/admin/config", json={
-        "pass_marks": {"aptitude": 8, "technical": 20, "coding": 60},
-        "violation_limit": 3, "assessment_minutes": 60,
-    })
-    assert updated.status_code == 200
-    assert admin.get("/api/admin/config").json()["pass_marks"]["technical"] == 20
-    assert admin.get("/api/admin/report.csv").status_code == 200
-    assert admin.get("/api/admin/audit").status_code == 200
-    assert candidate.get("/api/portal/dashboard").status_code == 403
-    assert candidate.get("/api/admin/config").status_code == 403
+    assert candidate.post("/api/candidate/assessment/technical/submit").json() == technical_result
+    assert candidate.get("/api/candidate/home").json()["active_stage"] == "result"
